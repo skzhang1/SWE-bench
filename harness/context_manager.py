@@ -47,6 +47,7 @@ class ExecWrapper:
     def __call__(self, cmd, raise_error=True, **kwargs):
         try:
             combined_args = {**self.subprocess_args, **kwargs}
+            combined_args["shell"] = True
             output = subprocess.run(cmd, **combined_args)
             return output
         except subprocess.CalledProcessError as e:

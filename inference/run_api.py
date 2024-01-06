@@ -18,6 +18,12 @@ from datasets import load_dataset, load_from_disk
 from make_datasets.utils import extract_diff
 from argparse import ArgumentParser
 import logging
+from autogen import AssistantAgent, UserProxyAgent, config_list_from_json
+from SweUserProxy import SweUserProxy
+from autogen.code_utils import execute_code
+import autogen
+import json
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -68,6 +74,7 @@ ENGINES = {
     "gpt-3.5-turbo-16k-0613": "gpt-35-turbo-16k",
     "gpt-4-0613": "gpt-4",
     "gpt-4-32k-0613": "gpt-4-32k",
+    "gpt-4-1106-preview": "gpt-4-1106-preview"
 }
 
 
@@ -92,6 +99,32 @@ def calc_cost(model_name, input_tokens, output_tokens):
 
 
 @retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
+def call_autogen(model_name_or_path, inputs, use_azure, temperature, top_p, **model_args):
+    user_message = inputs.split("\n", 1)[1]
+    config_list = autogen.config_list_from_json(
+        "OAI_CONFIG_LIST",
+        file_location="/home/svz5418/shaokun/EvoAgent",
+    )
+    assistant = AssistantAgent(
+        name="chatbot",
+        system_message="You are a helpful assistant.",
+        llm_config={
+                "timeout": 600,
+                "seed": 42,
+                "config_list": config_list,
+            }
+    )
+    user_proxy = SweUserProxy(
+        name = "user_proxy",
+        code_execution_config={
+            "work_dir": "_output", "use_docker": "shaokun529/evoagent:v1"},
+        human_input_mode="NEVER"
+    )
+    answer, chat_history = user_proxy.initiate_chat(assistant, query=user_message) # TODO: deal with history
+    cost = 0 # TOOD: calculate cost
+    return answer, cost
+
+@retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
 def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model_args):
     """
     Calls the openai API to generate completions for the given inputs.
@@ -106,6 +139,10 @@ def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model
     """
     system_messages = inputs.split("\n", 1)[0]
     user_message = inputs.split("\n", 1)[1]
+    print("-------------system_messages------------")
+    print(system_messages)
+    print("-------------user_message------------")
+    print(user_message)    
     try:
         if use_azure:
             response = openai.ChatCompletion.create(
@@ -129,9 +166,12 @@ def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model
                 top_p=top_p,
                 **model_args,
             )
+        calc_cost_model = response.model
+        if calc_cost_model == "gpt-4" and use_azure:
+            calc_cost_model = "gpt-4-1106-preview"
         input_tokens = response.usage.prompt_tokens
         output_tokens = response.usage.completion_tokens
-        cost = calc_cost(response.model, input_tokens, output_tokens)
+        cost = calc_cost(calc_cost_model, input_tokens, output_tokens)
         return response, cost
     except openai.error.InvalidRequestError as e:
         if e.code == "context_length_exceeded":
@@ -159,6 +199,7 @@ def openai_inference(
     model_args,
     existing_ids,
     max_cost,
+    is_autogen_origin = False,
 ):
     """
     Runs inference on a dataset using the openai API.
@@ -177,6 +218,8 @@ def openai_inference(
         desc="Filtering",
         load_from_cache_file=False,
     )
+    os.environ["AZURE_OPENAI_API_KEY"] = "1c0edd62999d48048b9d9e8a2000aca9"
+    os.environ["OPENAI_API_KEY"] = "1c0edd62999d48048b9d9e8a2000aca9"
     openai_key = os.environ.get("OPENAI_API_KEY", None)
     if openai_key is None:
         raise ValueError(
@@ -185,9 +228,10 @@ def openai_inference(
     openai.api_key = openai_key
     print(f"Using OpenAI key {'*' * max(0, len(openai_key)-5) + openai_key[-5:]}")
     use_azure = model_args.pop("use_azure", False)
+    use_azure = True
     if use_azure:
         openai.api_type = "azure"
-        openai.api_base = "https://pnlpopenai3.openai.azure.com/"
+        openai.api_base = "https://jialeoai.openai.azure.com/"
         openai.api_version = "2023-05-15"
     temperature = model_args.pop("temperature", 0.2)
     top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
@@ -197,6 +241,10 @@ def openai_inference(
     }
     total_cost = 0
     print(f"Filtered to {len(test_dataset)} instances")
+    print(output_file)
+    if not os.path.exists(output_file):
+        with open(output_file, "w") as file:
+            json.dump({}, file)
     with open(output_file, "a+") as f:
         for datum in tqdm(test_dataset, desc=f"Inference for {model_name_or_path}"):
             instance_id = datum["instance_id"]
@@ -205,14 +253,26 @@ def openai_inference(
             output_dict = {"instance_id": instance_id}
             output_dict.update(basic_args)
             output_dict["text"] = f"{datum['text']}\n\n"
-            response, cost = call_chat(
-                output_dict["model_name_or_path"],
-                output_dict["text"],
-                use_azure,
-                temperature,
-                top_p,
-            )
-            completion = response.choices[0]["message"]["content"]
+            if not is_autogen_origin:
+                response, cost = call_chat(
+                    output_dict["model_name_or_path"],
+                    output_dict["text"],
+                    use_azure,
+                    temperature,
+                    top_p,
+                )
+                completion = response.choices[0]["message"]["content"]
+            else:
+                response, cost = call_autogen(
+                    output_dict["model_name_or_path"],
+                    output_dict["text"],
+                    use_azure,
+                    temperature,
+                    top_p,
+                )
+                completion = response
+            print("--------------------completion-------------------")
+            print(completion)
             total_cost += cost
             print(f"Total Cost: {total_cost:.2f}")
             output_dict["full_output"] = completion
@@ -221,8 +281,6 @@ def openai_inference(
             if max_cost is not None and total_cost >= max_cost:
                 print(f"Reached max cost {max_cost}, exiting")
                 break
-
-
 @retry(wait=wait_random_exponential(min=60, max=600), stop=stop_after_attempt(6))
 def call_anthropic(
     inputs, anthropic, model_name_or_path, temperature, top_p, **model_args
@@ -373,6 +431,7 @@ def main(
     output_dir,
     model_args,
     max_cost,
+    is_autogen_origin,
 ):
     if shard_id is None and num_shards is not None:
         logger.warning(
@@ -400,8 +459,10 @@ def main(
                 existing_ids.add(instance_id)
     logger.info(f"Read {len(existing_ids)} already completed ids from {output_file}")
     if Path(dataset_name_or_path).exists():
+        print("Loading from disk")
         dataset = load_from_disk(dataset_name_or_path)
     else:
+        print("Loading from huggingface")
         dataset = load_dataset(dataset_name_or_path)
     if not split in dataset:
         raise ValueError(f"Invalid split {split} for dataset {dataset_name_or_path}")
@@ -416,6 +477,7 @@ def main(
         )
     if shard_id is not None and num_shards is not None:
         dataset = dataset.shard(num_shards, shard_id, contiguous=True)
+    dataset = dataset.select(range(10))
     inference_args = {
         "test_dataset": dataset,
         "model_name_or_path": model_name_or_path,
@@ -423,6 +485,7 @@ def main(
         "model_args": model_args,
         "existing_ids": existing_ids,
         "max_cost": max_cost,
+        "is_autogen_origin": is_autogen_origin,
     }
     if model_name_or_path.startswith("claude"):
         anthropic_inference(**inference_args)
@@ -484,5 +547,18 @@ if __name__ == "__main__":
         default=None,
         help="Maximum cost to spend on inference.",
     )
+    
+    parser.add_argument(
+        "--is_autogen_origin",
+        action="store_true",
+    )
     args = parser.parse_args()
     main(**vars(args))
+
+
+# python run_api.py --dataset_name_or_path princeton-nlp/SWE-bench_oracle --model_name_or_path gpt-4-1106-preview --output_dir ./outputs --is_autogen_origin
+#  '/home/svz5418/shaokun/SWE-bench/inference/outputs/gpt-4-1106-preview__SWE-bench_oracle__test.jsonl'
+# python run_evaluation.py --predictions_path /home/svz5418/shaokun/SWE-bench/inference/outputs/gpt-4-1106-preview__SWE-bench_oracle__test.jsonl 
+# --log_dir /home/svz5418/shaokun/SWE-bench/inference/outputs/log/ 
+# --swe_bench_tasks  /home/svz5418/shaokun/SWE-bench/harness/swe-bench.json 
+# --testbed /home/svz5418/shaokun/SWE-bench/inference/outputs/testbed/

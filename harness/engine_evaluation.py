@@ -71,12 +71,10 @@ def overwrite_ablation(tcm: TaskEnvContextManager, task_instance: Dict):
     
     # run testing script
     if not tcm.run_tests_task(task_instance):
-        return
-    
+        return    
     return
 
-
-def evaluate_predictions(data: Dict):
+def evaluate_predictions(data: Dict): ### TODO: here to apply path use to revise userproxy
     """
     Sets up task environment context manager. Each prediction is then
     evaluated within the context manager.
@@ -86,7 +84,7 @@ def evaluate_predictions(data: Dict):
             task_instances: List of [task instance, prediction] pairs to evalute
             + setup_testbed args
     """
-    data_dict = DotDict(data)
+    data_dict = DotDict(data) 
     for task_instance in tqdm(
         data_dict.task_instances,
         disable=data_dict.verbose,
